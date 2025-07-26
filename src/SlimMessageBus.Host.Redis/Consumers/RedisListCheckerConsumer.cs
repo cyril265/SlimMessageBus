@@ -60,48 +60,63 @@ public class RedisListCheckerConsumer : AbstractConsumer, IRedisConsumer
 
         while (!CancellationToken.IsCancellationRequested)
         {
-            Logger.LogTrace("Checking keys...");
-
-            var itemsArrived = false;
-
-            // for loop to avoid iterator allocation
-            for (var queueIndex = 0; queueIndex < _queues.Count; queueIndex++)
+            try
             {
-                var queue = _queues[queueIndex];
+                Logger.LogTrace("Checking keys...");
 
-                var value = await _database.ListLeftPopAsync(queue.Name).ConfigureAwait(false);
-                if (value != RedisValue.Null)
+                var itemsArrived = false;
+
+                // for loop to avoid iterator allocation
+                for (var queueIndex = 0; queueIndex < _queues.Count; queueIndex++)
                 {
-                    Logger.LogDebug("Retrieved value on queue {Queue}", queue.Name);
-                    try
+                    var queue = _queues[queueIndex];
+
+                    var value = await _database.ListLeftPopAsync(queue.Name).ConfigureAwait(false);
+                    if (value != RedisValue.Null)
                     {
-                        var transportMessage = (MessageWithHeaders)_envelopeSerializer.Deserialize(typeof(MessageWithHeaders), null, value, null);
-
-                        // for loop to avoid iterator allocation
-                        for (var i = 0; i < queue.Processors.Count && !CancellationToken.IsCancellationRequested; i++)
+                        Logger.LogDebug("Retrieved value on queue {Queue}", queue.Name);
+                        try
                         {
-                            var processor = queue.Processors[i];
+                            var transportMessage = (MessageWithHeaders)_envelopeSerializer.Deserialize(typeof(MessageWithHeaders), null, value, null);
 
-                            var r = await processor.ProcessMessage(transportMessage, transportMessage.Headers, cancellationToken: CancellationToken).ConfigureAwait(false);
-                            if (r.Exception != null)
+                            // for loop to avoid iterator allocation
+                            for (var i = 0; i < queue.Processors.Count && !CancellationToken.IsCancellationRequested; i++)
                             {
-                                Logger.LogError(r.Exception, "Error occurred while processing the list item on {Queue}", queue.Name);
+                                var processor = queue.Processors[i];
+
+                                var r = await processor.ProcessMessage(transportMessage, transportMessage.Headers, cancellationToken: CancellationToken).ConfigureAwait(false);
+                                if (r.Exception != null)
+                                {
+                                    Logger.LogError(r.Exception, "Error occurred while processing the list item on {Queue}", queue.Name);
+                                }
                             }
                         }
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.LogError(e, "Error occurred while processing the list item on {Queue}", queue.Name);
-                    }
+                        catch (Exception e)
+                        {
+                            Logger.LogError(e, "Error occurred while processing the list item on {Queue}", queue.Name);
+                        }
 
-                    itemsArrived = true;
-                    idle.Restart();
+                        itemsArrived = true;
+                        idle.Restart();
+                    }
+                }
+
+                if (!itemsArrived && _pollDelay != null && idle.Elapsed >= _maxIdle && !CancellationToken.IsCancellationRequested)
+                {
+                    Logger.LogTrace("Performing delay since no new items arrived");
+                    await Task.Delay(_pollDelay.Value).ConfigureAwait(false);
                 }
             }
-
-            if (!itemsArrived && _pollDelay != null && idle.Elapsed >= _maxIdle && !CancellationToken.IsCancellationRequested)
+            catch (Exception e)
             {
-                Logger.LogTrace("Performing delay since no new items arrived");
+                if (e is RedisConnectionException or RedisTimeoutException)
+                {
+                    Logger.LogWarning(e, "Connection error occurred while checking keys");
+                }
+                else
+                {
+                    Logger.LogError(e, "Error occurred while checking keys");
+                }
                 await Task.Delay(_pollDelay.Value).ConfigureAwait(false);
             }
         }
